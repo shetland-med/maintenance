@@ -5,6 +5,7 @@ import os
 import configparser
 from contextlib import closing
 import json
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 logger = None
@@ -14,49 +15,131 @@ def index():
     try:
         # アプリカテゴリの取得
         app_sql = create_app_sql()
-        print(f"app_sql: {app_sql}")
         apps_data = execution_sql(app_sql)
         
         # ニュース情報の取得
         news_sql = create_news_sql()
-        print(f"news_sql: {news_sql}")
         news_data = execution_sql(news_sql)
+        print(f"news_data:{news_data}")
+        news_data = create_status(news_data)
         
-        return render_template('index.html', news_data=news_data, apps_data=apps_data, filter_apps="")
+        return render_template('index.html', news_data=news_data, apps_data=apps_data)
     except Exception as e:
         print(f"(index): {e}")
 
 @app.route("/register", methods=["POST"])
 def register_news():
     try:
-        news_data = []
-        files = []
+        dic = {}
         for key, value in request.form.items():
-            if key.startswith("news_"):
-                news_data.append(json.loads(value))
-            if key.startswith("file_"):
-                files.append(request.files[key])
+            k = str(key.split("_")[1])
+            if k not in dic.keys():
+                dic[k] = {}
+                
+            if key.startswith("news"):
+                dic[k]["news"] = json.loads(value)
+                
+        for key in request.files:
+            k = str(key.split("_")[1])
+            if k not in dic.keys():
+                dic[k] = {}        
+            
+            if key.startswith("file"):
+                dic[k]["file"] = request.files[key]
+                
+                
         
         with closing(sqlite3.connect(app.config['DATABASE_NAME'])) as conn:
             cursor = conn.cursor()
-            for news in news_data:
+            for val in dic.values():
+                news = val['news']
+                file = None
+                if "file" in val:
+                    file = val["file"]
+                    
+                # ディレクトリが存在しない場合は作成
+                if not os.path.exists(app.config['OUTPUT_DIR']):
+                    os.makedirs(app.config['OUTPUT_DIR'])
+                    
+                if file is not None:
+                    # 現在の日時を取得
+                    now = datetime.now().strftime('%Y%m%d%H%M%S%f')
+                    base, extension = os.path.splitext(file.filename)
+                    file_name = f"{base}_{now}{extension}"
+                    # ファイル名をリネーム
+                    news['current']['6'] = file_name
+                    
+                app_id = select_appID(cursor, news['current']['0'])
                 if news['newRow']:
                     insert_sql, params = create_insert_sql(news)
                     cursor.execute(insert_sql, params)
                     news_id = cursor.lastrowid
-                    app_id_sql = "SELECT ID FROM App_Mgmt WHERE AppCategory = ?"
-                    cursor.execute(app_id_sql, (news['current'][0],))
-                    app_id = cursor.fetchone()[0]
                     id_mgmt_sql = "INSERT INTO ID_Mgmt (NewsID, AppID) VALUES (?, ?)"
                     cursor.execute(id_mgmt_sql, (news_id, app_id))
                 else:
                     update_sql, params = create_update_sql(news)
                     cursor.execute(update_sql, params)
+                    id_mgmt_sql = "Update ID_Mgmt SET AppID = ? Where NewsID = ?"
+                    cursor.execute(id_mgmt_sql, (app_id, news['current']['8']))
+                    
+                # ファイルのアップロード
+                if file:
+                    # ファイル名と日付を結合
+                    filename = os.path.join(app.config['OUTPUT_DIR'], file_name)
+                    file.save(filename)
+                    
             conn.commit()
         return jsonify({"status": "success"})
     except Exception as e:
         print(f"(register_news): {e}")
         return jsonify({"status": "error", "message": str(e)})
+    
+def select_appID(cursor, category):
+    try:
+        app_id_sql = "Select id from App_Mgmt Where AppCategory = ?"
+        cursor.execute(app_id_sql, (category,))
+        app_id = cursor.fetchone()[0]
+
+        return app_id
+    except Exception as e:
+        print(f"(select_appID): {e}")
+        
+# ステータスの追加
+def create_status(news_data):
+    try:
+        data = []
+        for row in news_data:
+            # 指定した日付
+            specified_date_str = row[4]
+            specified_date = datetime.strptime(specified_date_str, "%Y-%m-%d")
+            
+            li = list(row)
+            li[4] = specified_date.strftime("%Y-%m-%d")
+
+            # 公開期間の日数を加える
+            days_to_add = row[5]
+            end_date = specified_date + timedelta(days=days_to_add)
+
+            # 現在の日付を取得
+            current_date = datetime.now()
+
+            # 非表示フラグ
+            hidden_flg = row[7]
+
+            # 現在日付が公開期間内かどうかを判断
+            if specified_date < current_date < end_date and hidden_flg == 0:
+                li.append("掲載中")
+            elif end_date < current_date or hidden_flg == 1:
+                li.append("掲載終了")
+            else:
+                li.append("")
+
+            data.append(li)
+
+        return data
+    except Exception as e:
+        print(f"create_status:{e}")
+
 
 # sql文の実行
 def execution_sql(sql, params=[]):
@@ -79,22 +162,17 @@ def create_app_sql():
     except Exception as e:
         print(f"(create_app_sql): {e}")
 
-def create_news_sql(filter_app_list = []):
+def create_news_sql():
     try:
         sql = """
         SELECT App_Mgmt.AppCategory, News_Mgmt.Category, News_Mgmt.Title, News_Mgmt.Year, 
-        News_Mgmt.PublicationDate, News_Mgmt.Deadline, News_Mgmt.News_FileName, News_Mgmt.EndFlag 
+        News_Mgmt.PublicationDate, News_Mgmt.Deadline, News_Mgmt.News_FileName, News_Mgmt.EndFlag, News_Mgmt.ID
         FROM News_Mgmt 
         JOIN ID_Mgmt 
         ON News_Mgmt.ID = ID_Mgmt.NewsID 
         JOIN App_Mgmt 
-        ON ID_Mgmt.AppID = App_Mgmt.ID 
+        ON ID_Mgmt.AppID = App_Mgmt.ID; 
         """
-        where = "WHERE True"
-        if len(filter_app_list) > 0:
-            where += " AND AppCategory IN (" + ",".join(["?"] * len(filter_app_list)) + ")"
-        
-        sql = sql + where + ";"
         return sql
     except Exception as e:
         print(f"(create_news_sql): {e}")
@@ -106,7 +184,7 @@ def create_insert_sql(news):
         INSERT INTO News_Mgmt (Category, Title, Year, PublicationDate, Deadline, EndFlag, News_FileName)
         VALUES (?, ?, ?, ?, ?, ?, ?)
         """
-        params = (news['current'][1], news['current'][2], news['current'][3], news['current'][4], news['current'][5], news['current'][7], news['current'][6])
+        params = (news['current']['1'], news['current']['2'], news['current']['3'], news['current']['4'], news['current']['5'], news['current']['7'], news['current']['6'])
         return sql, params
     except Exception as e:
         print(f"(create_insert_sql): {e}")
@@ -119,7 +197,7 @@ def create_update_sql(news):
         UPDATE News_Mgmt SET Category = ?, Title = ?, Year = ?, PublicationDate = ?, Deadline = ?, EndFlag = ?, News_FileName = ?
         WHERE ID = ?
         """
-        params = (news['current'][1], news['current'][2], news['current'][3], news['current'][4], news['current'][5], news['current'][7], news['current'][6], news['original'][0])
+        params = (news['current']['1'], news['current']['2'], news['current']['3'], news['current']['4'], news['current']['5'], news['current']['7'], news['current']['6'], news['current']['8'])
         return sql, params
     except Exception as e:
         print(f"(create_update_sql): {e}")
@@ -128,10 +206,11 @@ def create_update_sql(news):
 # iniファイルの読み込み
 def read_ini():
     try:
-        global logger
+        global logger 
         config = configparser.ConfigParser()
         config.read('config.ini')
         app.config['DATABASE_NAME'] = config['DATABASE']['db_path']
+        app.config['OUTPUT_DIR'] = config['OUTPUT_DIR']['dir_path']
         # logger = _setup_logger()
     except Exception as e:
         print(f"(read_ini): {e}")
